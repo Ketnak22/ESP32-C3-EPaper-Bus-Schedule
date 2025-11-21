@@ -96,36 +96,40 @@ std::vector<ScheduleEntry> getStopScheduleBusstopComplex(const String& busStopId
     return allSchedules;
 }
 
-std::vector<ScheduleEntry> getFutureSchedules(const std::vector<ScheduleEntry> &allSchedules)
+std::vector<ScheduleEntry> getFutureSchedules(const std::vector<ScheduleEntry> &allSchedules, const int scheduleCount)
 {
   std::vector<ScheduleEntry> futureSchedules;
 
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo))
   {
-    return futureSchedules; // Return empty if time retrieval fails
+    return futureSchedules;
   }
 
-  // Calculate current time in minutes from midnight for easy comparison
   int currentTimeInMinutes = timeinfo.tm_hour * 60 + timeinfo.tm_min;
 
-  // Filter out past departures
+  // Collect all future departures
   for (const auto &entry : allSchedules)
   {
-    // Assuming entry.time is in "HH:MM" format
     int scheduleHour = entry.time.substring(0, 2).toInt();
     int scheduleMinute = entry.time.substring(3, 5).toInt();
     int scheduleTimeInMinutes = scheduleHour * 60 + scheduleMinute;
 
-    if (scheduleTimeInMinutes >= currentTimeInMinutes)
+    if (scheduleTimeInMinutes < currentTimeInMinutes)
     {
-      futureSchedules.push_back(entry);
+      continue; // Skip past departures
     }
+    futureSchedules.push_back(entry);
   }
 
-  // Sort the remaining future schedules by time
+  // Sort by time
   std::sort(futureSchedules.begin(), futureSchedules.end(), [](const ScheduleEntry &a, const ScheduleEntry &b)
             { return a.time < b.time; });
+
+  // Resize the vector to keep only the closest upcoming buses
+  if (futureSchedules.size() > scheduleCount) {
+      futureSchedules.resize(scheduleCount);
+  }
 
   return futureSchedules;
 }
@@ -142,6 +146,7 @@ std::vector<ScheduleEntry> convertScheduleTimesToMinutesLeft(const std::vector<S
 
   // Calculate current time in minutes from midnight for easy comparison
   int currentTimeInMinutes = timeinfo.tm_hour * 60 + timeinfo.tm_min;
+  int currentTimeInSeconds = currentTimeInMinutes * 60 + timeinfo.tm_sec;
 
   for (const auto &entry : schedules)
   {
@@ -153,10 +158,19 @@ std::vector<ScheduleEntry> convertScheduleTimesToMinutesLeft(const std::vector<S
     int scheduleTimeInMinutes = scheduleHour * 60 + scheduleMinute;
     
     int minutesLeft = scheduleTimeInMinutes - currentTimeInMinutes;
-    if (minutesLeft >= 0)
+    if (minutesLeft > 1)
     {
       updatedEntry.time = String(minutesLeft) + " min";
       updatedSchedules.push_back(updatedEntry);
+    } else if (minutesLeft == 1) {
+      updatedEntry.time = "<1 min";
+      updatedSchedules.push_back(updatedEntry);
+    } else if (minutesLeft == 0) {
+      updatedEntry.time = "Teraz";
+      updatedSchedules.push_back(updatedEntry);
+    } else {
+      // Skip past departures
+      continue;
     }
   }
 

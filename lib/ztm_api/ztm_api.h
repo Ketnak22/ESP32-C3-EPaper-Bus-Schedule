@@ -13,7 +13,7 @@ struct ScheduleEntry {
 std::vector<ScheduleEntry> getStopScheduleBusstopComplex(const String& busStopId, const std::vector<String>& busStopNrs);
 
 // Filters and returns only future schedules from the provided list
-std::vector<ScheduleEntry> getFutureSchedules(const std::vector<ScheduleEntry> &allSchedules);
+std::vector<ScheduleEntry> getFutureSchedules(const std::vector<ScheduleEntry> &allSchedules, const int scheduleCount);
 
 // Converts schedule times to minutes left from current time
 std::vector<ScheduleEntry> convertScheduleTimesToMinutesLeft(const std::vector<ScheduleEntry> &schedules);
