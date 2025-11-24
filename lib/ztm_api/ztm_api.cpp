@@ -122,6 +122,11 @@ std::vector<ScheduleEntry> getFutureSchedules(const std::vector<ScheduleEntry> &
     futureSchedules.push_back(entry);
   }
 
+  if (futureSchedules.empty())
+  {
+    return futureSchedules; // No future schedules found
+  }
+
   // Sort by time
   std::sort(futureSchedules.begin(), futureSchedules.end(), [](const ScheduleEntry &a, const ScheduleEntry &b)
             { return a.time < b.time; });
