@@ -20,8 +20,12 @@ const std::vector<String> WIDOCZNA_BUS_STOP_NRS = {String("01"), String("02")};
 const String WIDOCZNA_BUS_STOP_NAME = "Majdan Widoczna";
 
 const String PRASKIEGO_PULKU_BUS_STOP_ID = "2293"; 
-const std::vector<String> PRASKIEGO_PULKU_BUS_STOP_NRS = {String("01"), String("02")};
+const std::vector<String> PRASKIEGO_PULKU_BUS_STOP_NRS = {String("01")};
 const String PRASKIEGO_PULKU_BUS_STOP_NAME = "1. Praskiego Pułku";
+
+const String MARSZALKOWSKA_BUS_STOP_ID = "7009";
+const std::vector<String> MARSZALKOWSKA_BUS_STOP_NRS = {String("01")};
+const String MARSZALKOWSKA_BUS_STOP_NAME = "Marszałkowska";
 
 #define ENABLE_GxEPD2_display 0
 #include <GxEPD2_BW.h>
@@ -70,18 +74,18 @@ void setup()
   SPI.begin(EPD_SCK, -1, EPD_MOSI, EPD_CS);
   display.init(115200, true, 50, false);
 
-  // Full clear display for long term storage
-  // To delete later
-  display.setFullWindow();
-  display.firstPage();
-  do
-  {
-    display.fillScreen(GxEPD_WHITE);
-  } while (display.nextPage());
-  display.hibernate();
-  while (true) {
-    delay(1000);
-  }
+  // // Full clear display for long term storage
+  // // To delete later
+  // display.setFullWindow();
+  // display.firstPage();
+  // do
+  // {
+  //   display.fillScreen(GxEPD_WHITE);
+  // } while (display.nextPage());
+  // display.hibernate();
+  // while (true) {
+  //   delay(1000);
+  // }
 
   u8g2.begin(display);
   u8g2.setFontMode(1);
@@ -100,7 +104,17 @@ void setup()
   syncTime();
 
   showStatusMessage("Pobieranie danych...");
-  schedules = getStopScheduleBusstopComplex(WIDOCZNA_BUS_STOP_ID, WIDOCZNA_BUS_STOP_NRS);
+  schedules = getStopScheduleBusstopComplex(MARSZALKOWSKA_BUS_STOP_ID, MARSZALKOWSKA_BUS_STOP_NRS);
+
+  for (const auto &entry : schedules)
+  {
+    Serial.print("Line: ");
+    Serial.print(entry.line);
+    Serial.print(", Direction: ");
+    Serial.print(entry.direction);
+    Serial.print(", Time: ");
+    Serial.println(entry.time);
+  }
 
   showStatusMessage("Usypianie WiFi...");
   WiFi.disconnect(true);
@@ -140,8 +154,10 @@ void loop()
     connectToWifi();
     syncTime();
 
-    schedules = getStopScheduleBusstopComplex(WIDOCZNA_BUS_STOP_ID, WIDOCZNA_BUS_STOP_NRS);
-    
+    showStatusMessage("Pobieranie danych...");
+
+    schedules = getStopScheduleBusstopComplex(MARSZALKOWSKA_BUS_STOP_ID, MARSZALKOWSKA_BUS_STOP_NRS);
+
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
 
@@ -176,7 +192,6 @@ void loop()
       displayBusStopSchedule(schedulesY, displayedSchedules);
     } while (display.nextPage());
   }
-
   display.hibernate();
 
   // Recalculate time to sleep until the next full minute
@@ -212,7 +227,7 @@ void drawBackground(bool isFullRefresh) {
   {
     display.fillScreen(GxEPD_WHITE);
 
-    displayBusStopName(WIDOCZNA_BUS_STOP_NAME, WIDOCZNA_BUS_STOP_NRS);
+    displayBusStopName(MARSZALKOWSKA_BUS_STOP_NAME, MARSZALKOWSKA_BUS_STOP_NRS);
 
     int lineY = (int)(1.5 * BUS_STOP_NAME_Y_OFFSET);
     display.drawLine(X_MARGIN, lineY, display.width() - X_MARGIN, lineY, GxEPD_BLACK);

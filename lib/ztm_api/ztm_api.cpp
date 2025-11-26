@@ -4,6 +4,7 @@
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
+#include <algorithm> // Required for std::sort and std::unique
 
 // Helper function to perform HTTPS GET requests
 String httpGETRequest(const String& url);
@@ -13,10 +14,26 @@ std::vector<String> getLines(const String& busStopId, const String& busStopNr);
 std::vector<ScheduleEntry> getStopSchedule(const String& busStopId, const String& busStopNr, const String& line);
 std::vector<ScheduleEntry> getStopScheduleAllLines(const String& busStopId, const String& busStopNr);
 
+int getMinutesFromMidnight(String timeStr) {
+    // Handle ZTM "24:xx" format and standard "HH:MM"
+    int hour = timeStr.substring(0, 2).toInt();
+    int minute = timeStr.substring(3, 5).toInt();
+    return hour * 60 + minute;
+}
+
+int getCurrentMinutesFromMidnight() {
+    struct tm timeinfo;
+    if (!getLocalTime(&timeinfo)) return -1; // Time not set
+    return timeinfo.tm_hour * 60 + timeinfo.tm_min;
+}
+
 String httpGETRequest(const String& url) {
     std::unique_ptr<WiFiClientSecure> client(new WiFiClientSecure);
     client->setInsecure();
     HTTPClient https;
+
+    // Longer timeout for large payloads
+    https.setTimeout(10000); 
 
     if (https.begin(*client, url)) {
         int httpCode = https.GET();
@@ -35,13 +52,28 @@ std::vector<String> getLines(const String& busStopId, const String& busStopNr) {
     String payload = httpGETRequest(url);
     if (payload.length() == 0) return lines;
 
-    DynamicJsonDocument doc(2048);
-    if (deserializeJson(doc, payload) == DeserializationError::Ok) {
+    // ArduinoJson v7, so no size specification needed
+    JsonDocument doc;
+    
+    DeserializationError error = deserializeJson(doc, payload);
+
+    if (error == DeserializationError::Ok) {
         JsonArray result = doc["result"];
         for (JsonObject item : result) {
             lines.push_back(item["values"][0]["value"].as<String>());
         }
+    } else {
+        Serial.print("JSON Error in getLines: ");
+        Serial.println(error.c_str());
     }
+
+    // Filter duplicates
+    if (!lines.empty()) {
+        std::sort(lines.begin(), lines.end());
+        auto last = std::unique(lines.begin(), lines.end());
+        lines.erase(last, lines.end());
+    }
+
     return lines;
 }
 
@@ -52,35 +84,55 @@ std::vector<ScheduleEntry> getStopSchedule(const String& busStopId, const String
     String payload = httpGETRequest(url);
     if (payload.length() == 0) return schedules;
 
-    StaticJsonDocument<256> filter;
+    // Create the filter
+    JsonDocument filter;
     filter["result"][0][0]["key"] = true;
     filter["result"][0][0]["value"] = true;
 
-    DynamicJsonDocument doc(8192);
-    if (deserializeJson(doc, payload, DeserializationOption::Filter(filter)) == DeserializationError::Ok) {
-        JsonArray result = doc["result"];
-        for (JsonArray item : result) {
-            ScheduleEntry entry;
-            entry.line = line;
-            for (JsonObject val : item) {
-                const char* key = val["key"];
-                if (strcmp(key, "kierunek") == 0) {
-                    entry.direction = val["value"].as<String>();
-                }
-                if (strcmp(key, "czas") == 0) {
-                    entry.time = val["value"].as<String>();
-                }
-            }
-            schedules.push_back(entry);
-        }
+    // ArduinoJson v7, so automatically expands memory as needed
+    JsonDocument doc;
+    
+    DeserializationError error = deserializeJson(doc, payload, DeserializationOption::Filter(filter));
+
+    if (error) {
+        Serial.print("JSON Error for line ");
+        Serial.print(line);
+        Serial.print(": ");
+        Serial.println(error.c_str());
+        return schedules;
     }
+
+    JsonArray result = doc["result"];
+    for (JsonArray item : result) {
+        ScheduleEntry entry;
+        entry.line = line;
+        for (JsonObject val : item) {
+            const char* key = val["key"];
+            // Use strcmp for safety, though string comparison operators work too
+            if (strcmp(key, "kierunek") == 0) {
+                entry.direction = val["value"].as<String>();
+            }
+            if (strcmp(key, "czas") == 0) {
+                entry.time = val["value"].as<String>();
+            }
+        }
+        schedules.push_back(entry);
+    }
+    
     return schedules;
 }
 
 std::vector<ScheduleEntry> getStopScheduleAllLines(const String& busStopId, const String& busStopNr) {
     std::vector<String> lines = getLines(busStopId, busStopNr);
     std::vector<ScheduleEntry> allSchedules;
+    
+    Serial.print("Fetching schedules for lines: ");
+    for(const auto& l : lines) Serial.print(l + " ");
+    Serial.println();
+
     for (const String& line : lines) {
+        // Small delay to stabilize connection between requests
+        delay(50);
         std::vector<ScheduleEntry> lineSchedules = getStopSchedule(busStopId, busStopNr, line);
         allSchedules.insert(allSchedules.end(), lineSchedules.begin(), lineSchedules.end());
     }
