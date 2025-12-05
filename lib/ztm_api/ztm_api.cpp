@@ -2,234 +2,121 @@
 #include "secrets.h"
 
 #include <HTTPClient.h>
-#include <WiFiClientSecure.h>
+#include <WiFiClient.h>
 #include <ArduinoJson.h>
-#include <algorithm> // Required for std::sort and std::unique
+#include <algorithm> // for std::remove_if
 
-// Helper function to perform HTTPS GET requests
-String httpGETRequest(const String& url);
-
-// Internal helper functions
-std::vector<String> getLines(const String& busStopId, const String& busStopNr);
-std::vector<ScheduleEntry> getStopSchedule(const String& busStopId, const String& busStopNr, const String& line);
-std::vector<ScheduleEntry> getStopScheduleAllLines(const String& busStopId, const String& busStopNr);
-
-int getMinutesFromMidnight(String timeStr) {
-    // Handle ZTM "24:xx" format and standard "HH:MM"
-    int hour = timeStr.substring(0, 2).toInt();
-    int minute = timeStr.substring(3, 5).toInt();
-    return hour * 60 + minute;
-}
-
-int getCurrentMinutesFromMidnight() {
+// Helper to get current minutes from midnight
+int getCurrentMinutes() {
     struct tm timeinfo;
-    if (!getLocalTime(&timeinfo)) return -1; // Time not set
+    if (!getLocalTime(&timeinfo)) return -1;
     return timeinfo.tm_hour * 60 + timeinfo.tm_min;
 }
 
-String httpGETRequest(const String& url) {
-    std::unique_ptr<WiFiClientSecure> client(new WiFiClientSecure);
-    client->setInsecure();
-    HTTPClient https;
-
-    // Longer timeout for large payloads
-    https.setTimeout(10000); 
-
-    if (https.begin(*client, url)) {
-        int httpCode = https.GET();
-        if (httpCode > 0 && (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_MOVED_PERMANENTLY)) {
-            return https.getString();
-        }
-        https.end();
-    }
-    return "";
+// Helper: Parse "HH:MM" to minutes
+int parseTimeStr(String timeStr) {
+    int h = timeStr.substring(0, 2).toInt();
+    int m = timeStr.substring(3, 5).toInt();
+    return h * 60 + m;
 }
 
-std::vector<String> getLines(const String& busStopId, const String& busStopNr) {
-    std::vector<String> lines;
-    String url = "https://api.um.warszawa.pl/api/action/dbtimetable_get/?id=88cd555f-6f31-43ca-9de4-66c479ad5942&busstopId=" + busStopId + "&busstopNr=" + busStopNr + "&apikey=" + String(ZTM_API_KEY);
-    
-    String payload = httpGETRequest(url);
-    if (payload.length() == 0) return lines;
-
-    // ArduinoJson v7, so no size specification needed
-    JsonDocument doc;
-    
-    DeserializationError error = deserializeJson(doc, payload);
-
-    if (error == DeserializationError::Ok) {
-        JsonArray result = doc["result"];
-        for (JsonObject item : result) {
-            lines.push_back(item["values"][0]["value"].as<String>());
-        }
-    } else {
-        Serial.print("JSON Error in getLines: ");
-        Serial.println(error.c_str());
-    }
-
-    // Filter duplicates
-    if (!lines.empty()) {
-        std::sort(lines.begin(), lines.end());
-        auto last = std::unique(lines.begin(), lines.end());
-        lines.erase(last, lines.end());
-    }
-
-    return lines;
-}
-
-std::vector<ScheduleEntry> getStopSchedule(const String& busStopId, const String& busStopNr, const String& line) {
+std::vector<ScheduleEntry> fetchScheduleFromServer(const String& busStopId, const String& busStopNr) {
     std::vector<ScheduleEntry> schedules;
-    String url = "https://api.um.warszawa.pl/api/action/dbtimetable_get/?id=e923fa0e-d96c-43f9-ae6e-60518c9f3238&busstopId=" + busStopId + "&busstopNr=" + busStopNr + "&line=" + line + "&apikey=" + String(ZTM_API_KEY);
 
-    String payload = httpGETRequest(url);
-    if (payload.length() == 0) return schedules;
+    if (WiFi.status() != WL_CONNECTED) return schedules;
 
-    // Create the filter
-    JsonDocument filter;
-    filter["result"][0][0]["key"] = true;
-    filter["result"][0][0]["value"] = true;
+    int currentMins = getCurrentMinutes();
+    if (currentMins == -1) return schedules;
 
-    // ArduinoJson v7, so automatically expands memory as needed
-    JsonDocument doc;
-    
-    DeserializationError error = deserializeJson(doc, payload, DeserializationOption::Filter(filter));
+    HTTPClient http;
+    WiFiClient client;
 
-    if (error) {
-        Serial.print("JSON Error for line ");
-        Serial.print(line);
-        Serial.print(": ");
-        Serial.println(error.c_str());
-        return schedules;
-    }
+    // Call your Python API
+    String url = String(SERVER_URL) + "/get_stop_schedule" + 
+                 "?busStopId=" + busStopId + 
+                 "&busStopNr=" + busStopNr + 
+                 "&currentTimeInMinutes=" + String(currentMins);
 
-    JsonArray result = doc["result"];
-    for (JsonArray item : result) {
-        ScheduleEntry entry;
-        entry.line = line;
-        for (JsonObject val : item) {
-            const char* key = val["key"];
-            // Use strcmp for safety, though string comparison operators work too
-            if (strcmp(key, "kierunek") == 0) {
-                entry.direction = val["value"].as<String>();
-            }
-            if (strcmp(key, "czas") == 0) {
-                entry.time = val["value"].as<String>();
+    http.setTimeout(5000); 
+    http.begin(client, url);
+
+    int httpCode = http.GET();
+    if (httpCode == HTTP_CODE_OK) {
+        String payload = http.getString();
+        JsonDocument doc;
+        DeserializationError error = deserializeJson(doc, payload);
+
+        if (!error) {
+            JsonArray arr = doc.as<JsonArray>();
+            for (JsonObject obj : arr) {
+                ScheduleEntry entry;
+                entry.line = obj["linia"].as<String>();
+                entry.direction = obj["kierunek"].as<String>();
+                // Python sends "16:41:00", we want "16:41"
+                String fullTime = obj["czas"].as<String>();
+                entry.time = fullTime.substring(0, 5); 
+                schedules.push_back(entry);
+                if(schedules.size() >= 15) break; 
             }
         }
-        schedules.push_back(entry);
     }
-    
+    http.end();
     return schedules;
 }
 
-std::vector<ScheduleEntry> getStopScheduleAllLines(const String& busStopId, const String& busStopNr) {
-    std::vector<String> lines = getLines(busStopId, busStopNr);
-    std::vector<ScheduleEntry> allSchedules;
-    
-    Serial.print("Fetching schedules for lines: ");
-    for(const auto& l : lines) Serial.print(l + " ");
-    Serial.println();
+void removePastSchedules(std::vector<ScheduleEntry> &schedules) {
+    int currentMins = getCurrentMinutes();
+    if (currentMins == -1) return;
 
-    for (const String& line : lines) {
-        // Small delay to stabilize connection between requests
-        delay(50);
-        std::vector<ScheduleEntry> lineSchedules = getStopSchedule(busStopId, busStopNr, line);
-        allSchedules.insert(allSchedules.end(), lineSchedules.begin(), lineSchedules.end());
-    }
-    return allSchedules;
+    // Use erase-remove idiom to filter vector in place
+    schedules.erase(std::remove_if(schedules.begin(), schedules.end(), [currentMins](const ScheduleEntry &entry) {
+        int busMins = parseTimeStr(entry.time);
+        int diff = busMins - currentMins;
+
+        // Handle midnight (Bus 00:05 vs Current 23:55 -> diff approx -1430)
+        // If bus is 24:05 (ZTM format) and current is 00:05, we need to handle that.
+        // Assuming Python returns ZTM format (24:xx), and getCurrentMinutes returns standard (00:xx).
+        // Standard diff:
+        
+        // Case 1: Bus 24:05 (1445), Current 00:05 (5). Diff = 1440. Keep.
+        // Case 2: Bus 16:00 (960), Current 16:02 (962). Diff = -2. Remove.
+        // Case 3: Bus 00:05 (5), Current 23:55 (1435). Diff = -1430. Keep (Next day).
+
+        // If diff is huge positive (1400+), it means Bus is "24:xx" and we are "00:xx". It's future.
+        // If diff is huge negative (-1400+), it means Bus is "00:xx" and we are "23:xx". It's future.
+        
+        if (diff > 1000) return false; // Future (Midnight wrap)
+        if (diff < -1000) return false; // Future (Midnight wrap)
+
+        // Remove if passed more than 1 minute ago (diff < -1)
+        return diff < -1; 
+    }), schedules.end());
 }
 
-std::vector<ScheduleEntry> getStopScheduleBusstopComplex(const String& busStopId, const std::vector<String>& busStopNrs) {
-    std::vector<ScheduleEntry> allSchedules;
-    for (const String& busStopNr : busStopNrs) {
-        std::vector<ScheduleEntry> stopSchedules = getStopScheduleAllLines(busStopId, busStopNr);
-        allSchedules.insert(allSchedules.end(), stopSchedules.begin(), stopSchedules.end());
+std::vector<ScheduleEntry> convertScheduleTimesToMinutesLeft(const std::vector<ScheduleEntry> &schedules) {
+    std::vector<ScheduleEntry> updatedSchedules;
+    int currentMins = getCurrentMinutes();
+    if (currentMins == -1) return schedules;
+
+    for (const auto &entry : schedules) {
+        ScheduleEntry newEntry = entry;
+        int busMins = parseTimeStr(entry.time);
+        int diff = busMins - currentMins;
+      
+        
+        if (diff > 1000) { 
+             // Special case: Bus 24:10 (1450), Current 00:05 (5). Diff = 1445.
+             // Real diff is 5 minutes.
+             diff = diff - 1440; 
+        }
+
+        if (diff > 1) {
+             newEntry.time = String(diff) + " min";
+             updatedSchedules.push_back(newEntry);
+        } else if (diff >= 0) {
+             newEntry.time = (diff == 0) ? "Teraz" : "<1 min";
+             updatedSchedules.push_back(newEntry);
+        }
     }
-    return allSchedules;
-}
-
-std::vector<ScheduleEntry> getFutureSchedules(const std::vector<ScheduleEntry> &allSchedules, const int scheduleCount)
-{
-  std::vector<ScheduleEntry> futureSchedules;
-
-  struct tm timeinfo;
-  if (!getLocalTime(&timeinfo))
-  {
-    return futureSchedules;
-  }
-
-  int currentTimeInMinutes = timeinfo.tm_hour * 60 + timeinfo.tm_min;
-
-  // Collect all future departures
-  for (const auto &entry : allSchedules)
-  {
-    int scheduleHour = entry.time.substring(0, 2).toInt();
-    int scheduleMinute = entry.time.substring(3, 5).toInt();
-    int scheduleTimeInMinutes = scheduleHour * 60 + scheduleMinute;
-
-    if (scheduleTimeInMinutes < currentTimeInMinutes)
-    {
-      continue; // Skip past departures
-    }
-    futureSchedules.push_back(entry);
-  }
-
-  if (futureSchedules.empty())
-  {
-    return futureSchedules; // No future schedules found
-  }
-
-  // Sort by time
-  std::sort(futureSchedules.begin(), futureSchedules.end(), [](const ScheduleEntry &a, const ScheduleEntry &b)
-            { return a.time < b.time; });
-
-  // Resize the vector to keep only the closest upcoming buses
-  if (futureSchedules.size() > scheduleCount) {
-      futureSchedules.resize(scheduleCount);
-  }
-
-  return futureSchedules;
-}
-
-std::vector<ScheduleEntry> convertScheduleTimesToMinutesLeft(const std::vector<ScheduleEntry> &schedules)
-{
-  std::vector<ScheduleEntry> updatedSchedules;
-
-  struct tm timeinfo;
-  if (!getLocalTime(&timeinfo))
-  {
-    return updatedSchedules; // Return empty if time retrieval fails
-  }
-
-  // Calculate current time in minutes from midnight for easy comparison
-  int currentTimeInMinutes = timeinfo.tm_hour * 60 + timeinfo.tm_min;
-  int currentTimeInSeconds = currentTimeInMinutes * 60 + timeinfo.tm_sec;
-
-  for (const auto &entry : schedules)
-  {
-    ScheduleEntry updatedEntry = entry;
-
-    // Assuming entry.time is in "HH:MM" format
-    int scheduleHour = entry.time.substring(0, 2).toInt();
-    int scheduleMinute = entry.time.substring(3, 5).toInt();
-    int scheduleTimeInMinutes = scheduleHour * 60 + scheduleMinute;
-    
-    int minutesLeft = scheduleTimeInMinutes - currentTimeInMinutes;
-    if (minutesLeft > 1)
-    {
-      updatedEntry.time = String(minutesLeft) + " min";
-      updatedSchedules.push_back(updatedEntry);
-    } else if (minutesLeft == 1) {
-      updatedEntry.time = "<1 min";
-      updatedSchedules.push_back(updatedEntry);
-    } else if (minutesLeft == 0) {
-      updatedEntry.time = "Teraz";
-      updatedSchedules.push_back(updatedEntry);
-    } else {
-      // Skip past departures
-      continue;
-    }
-  }
-
-  return updatedSchedules;
+    return updatedSchedules;
 }

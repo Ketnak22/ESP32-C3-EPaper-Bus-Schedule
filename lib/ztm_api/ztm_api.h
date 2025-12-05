@@ -1,19 +1,18 @@
 #pragma once
-
 #include <Arduino.h>
 #include <vector>
 
 struct ScheduleEntry {
     String line;
     String direction;
-    String time;
+    String time; // "HH:MM"
 };
 
-// Gets the complete schedule for a bus stop complex (multiple bus stop numbers)
-std::vector<ScheduleEntry> getStopScheduleBusstopComplex(const String& busStopId, const std::vector<String>& busStopNrs);
+// Network Fetch
+std::vector<ScheduleEntry> fetchScheduleFromServer(const String& busStopId, const String& busStopNr);
 
-// Filters and returns only future schedules from the provided list
-std::vector<ScheduleEntry> getFutureSchedules(const std::vector<ScheduleEntry> &allSchedules, const int scheduleCount);
+// Removes buses from the vector that have already departed (based on current time)
+void removePastSchedules(std::vector<ScheduleEntry> &schedules);
 
-// Converts schedule times to minutes left from current time
+// Converts "14:00" to "5 min" for display
 std::vector<ScheduleEntry> convertScheduleTimesToMinutesLeft(const std::vector<ScheduleEntry> &schedules);

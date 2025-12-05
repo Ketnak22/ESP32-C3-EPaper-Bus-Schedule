@@ -4,3 +4,7 @@
 .vscode/launch.json
 .vscode/ipch
 include/secrets.h
+.env
+__pycache__
+bus_stop_data_server_esp32
+bus-schedule-middleware.tar.gz

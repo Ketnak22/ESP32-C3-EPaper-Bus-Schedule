@@ -1,36 +1,27 @@
 #include <Arduino.h>
 #include <vector>
-
 #include <WiFi.h>
 #include <time.h>
 
-#include <ztm_api.h>
+#include "ztm_api.h"
 #include "secrets.h"
 
 #include <U8g2_for_Adafruit_GFX.h>
 
-const char *ssid = SECRET_SSID;
-const char *password = SECRET_PASS;
+const String BUS_STOP_ID = "7009"; // Marszałkowska
+const String BUS_STOP_NR = "01";
+const String BUS_STOP_NAME = "Marszałkowska";
+
+// Assuming refresh every 1 minute, do a full refresh every 60 minutes
+const int FULL_REFRESH_THRESHOLD = 60; 
 
 const char *ntpServer = "pool.ntp.org";
 const char *tzInfo = "CET-1CEST,M3.5.0,M10.5.0/3";
 
-const String WIDOCZNA_BUS_STOP_ID = "2329";
-const std::vector<String> WIDOCZNA_BUS_STOP_NRS = {String("01"), String("02")};
-const String WIDOCZNA_BUS_STOP_NAME = "Majdan Widoczna";
-
-const String PRASKIEGO_PULKU_BUS_STOP_ID = "2293"; 
-const std::vector<String> PRASKIEGO_PULKU_BUS_STOP_NRS = {String("01")};
-const String PRASKIEGO_PULKU_BUS_STOP_NAME = "1. Praskiego Pułku";
-
-const String MARSZALKOWSKA_BUS_STOP_ID = "7009";
-const std::vector<String> MARSZALKOWSKA_BUS_STOP_NRS = {String("01")};
-const String MARSZALKOWSKA_BUS_STOP_NAME = "Marszałkowska";
-
 #define ENABLE_GxEPD2_display 0
 #include <GxEPD2_BW.h>
 
-// Connections for ESP32-C3 Supermini
+// Pin Declarations
 static const uint8_t EPD_BUSY = 21;
 static const uint8_t EPD_CS = 5;
 static const uint8_t EPD_RST = 7;
@@ -39,195 +30,150 @@ static const uint8_t EPD_SCK = 8;
 static const uint8_t EPD_MOSI = 10;
 
 GxEPD2_BW<GxEPD2_420_GDEY042T81, GxEPD2_420_GDEY042T81::HEIGHT> display(GxEPD2_420_GDEY042T81(EPD_CS, EPD_DC, EPD_RST, EPD_BUSY));
-
 U8G2_FOR_ADAFRUIT_GFX u8g2;
 
-std::vector<ScheduleEntry> schedules;
-
+// Layout Constants
 static const uint8_t X_MARGIN = 25;
 static const uint8_t LINE_TEXTBOX_PADDING = 8;
-static const uint8_t Y_OFFSET = 50;
 static const uint8_t BUS_STOP_NAME_Y_OFFSET = 45;
 static const uint8_t HEADER_ROW_HEIGHT = 34;
+static const uint8_t Y_OFFSET = 50;
 
 int schedulesY = 0;
 int secondLineY = 0;
-int lastMinute = -1;
 
-/* --- FUNCTION DECLARATIONS --- */
-void connectToWifi();
-void syncTime();
+// Global cache of schedules
+std::vector<ScheduleEntry> globalSchedules;
+
+// Refresh Counter (Stored in RTC memory to survive sleep)
+RTC_DATA_ATTR int refreshCounter = 0;
+
+// Declarations
+void connectToWifi(bool silent);
+void syncTime(bool silent);
 void drawBackground(bool isFullRefresh);
 void displayBusStopSchedule(const int y, const std::vector<ScheduleEntry> &schedules);
-void displayTextOnCenter(const String &text);
 void displayTextOnCenterHorizontally(const String &text, const int y);
+void displayTextOnCenter(const String &text);
 void showStatusMessage(const String &text);
-void displayBusStopName(const String &busStopName, const std::vector<String> &busStopNrs);
+void displayBusStopName(const String &busStopName, const String &busStopNr);
 
-void setup()
-{
+void setup() {
   Serial.begin(115200);
-  // Wait for serial or timeout (standard ESP32-C3 check)
-  unsigned long start = millis();
-  while (!Serial && millis() - start < 2000);
 
   SPI.begin(EPD_SCK, -1, EPD_MOSI, EPD_CS);
   display.init(115200, true, 50, false);
-
-  // // Full clear display for long term storage
-  // // To delete later
-  // display.setFullWindow();
-  // display.firstPage();
-  // do
-  // {
-  //   display.fillScreen(GxEPD_WHITE);
-  // } while (display.nextPage());
-  // display.hibernate();
-  // while (true) {
-  //   delay(1000);
-  // }
-
   u8g2.begin(display);
   u8g2.setFontMode(1);
   u8g2.setBackgroundColor(GxEPD_WHITE);
   u8g2.setForegroundColor(GxEPD_BLACK);
 
-  // Initial Full Clear
+  // Initial Clear
   display.setFullWindow();
   display.firstPage();
-  do
-  {
-    display.fillScreen(GxEPD_WHITE);
-  } while (display.nextPage());
+  do { display.fillScreen(GxEPD_WHITE); } while (display.nextPage());
 
-  connectToWifi();
-  syncTime();
+  // Setup Network & Time
+  connectToWifi(false);
+  syncTime(false);
 
+  // Initial Fetch
   showStatusMessage("Pobieranie danych...");
-  schedules = getStopScheduleBusstopComplex(MARSZALKOWSKA_BUS_STOP_ID, MARSZALKOWSKA_BUS_STOP_NRS);
-
-  for (const auto &entry : schedules)
-  {
-    Serial.print("Line: ");
-    Serial.print(entry.line);
-    Serial.print(", Direction: ");
-    Serial.print(entry.direction);
-    Serial.print(", Time: ");
-    Serial.println(entry.time);
-  }
-
-  showStatusMessage("Usypianie WiFi...");
+  globalSchedules = fetchScheduleFromServer(BUS_STOP_ID, BUS_STOP_NR);
+  
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
-  delay(100);
 
-  // Draw the initial Interface
+  // Initial full draw
   drawBackground(true);
+  
+  // Reset counter on clean boot
+  refreshCounter = 0; 
 }
 
-void loop()
-{
+void loop() {
+  
   struct tm timeinfo;
-  if (!getLocalTime(&timeinfo))
-  {
-    connectToWifi();
-    syncTime();
-    WiFi.disconnect(true);
-    WiFi.mode(WIFI_OFF);
-    return; 
+  bool timeValid = getLocalTime(&timeinfo);
+  
+  if (!timeValid) {
+      connectToWifi(true);
+      syncTime(true);
+      WiFi.disconnect(true);
+      WiFi.mode(WIFI_OFF);
+      getLocalTime(&timeinfo);
   }
 
-  // Full Refresh Every Hour
-  // Check if minute is 0 and we haven't done it yet this minute
-  if (timeinfo.tm_min == 0 && lastMinute != 0)
-  {
-    // Perform Full Refresh to clear ghosting.
-    drawBackground(true);
+  removePastSchedules(globalSchedules);
+
+  if (globalSchedules.size() <= 3) {
+      
+      Serial.println("Fetching new data...");
+      
+      connectToWifi(true);
+      syncTime(true); 
+
+      // Fetch fresh data
+      std::vector<ScheduleEntry> freshData = fetchScheduleFromServer(BUS_STOP_ID, BUS_STOP_NR);
+      
+      if (!freshData.empty()) {
+          globalSchedules = freshData;
+      }
+      
+      WiFi.disconnect(true);
+      WiFi.mode(WIFI_OFF);
+  } else {
+      Serial.printf("Cache ok (%d buses). Skipping WiFi.\n", globalSchedules.size());
   }
-  lastMinute = timeinfo.tm_min;
 
-  // Data refresh
-  std::vector<ScheduleEntry> displayedSchedules = getFutureSchedules(schedules, 3);
+  // Full refresh logic
+  refreshCounter++;
+  
+  if (refreshCounter >= FULL_REFRESH_THRESHOLD) {
+      Serial.println("Triggering Full Refresh to clean ghosting...");
+      drawBackground(true);
+      refreshCounter = 0;
+  }
 
-  if (displayedSchedules.empty())
-  {
-    connectToWifi();
-    syncTime();
+  // Calculate x minutes left
+  std::vector<ScheduleEntry> displayList = convertScheduleTimesToMinutesLeft(globalSchedules);
+  displayList.resize(std::min((size_t)3, displayList.size())); // Limit to 3 entries
 
-    showStatusMessage("Pobieranie danych...");
+  // Populate schedules
+  display.setPartialWindow(0, secondLineY + 1, display.width(), display.height() - secondLineY - 1);
+  display.firstPage();
+  do {
+    display.fillScreen(GxEPD_WHITE);
 
-    schedules = getStopScheduleBusstopComplex(MARSZALKOWSKA_BUS_STOP_ID, MARSZALKOWSKA_BUS_STOP_NRS);
-
-    WiFi.disconnect(true);
-    WiFi.mode(WIFI_OFF);
-
-    // Refresh the list
-    displayedSchedules = getFutureSchedules(schedules, 3);
-    
-    // If still empty, show error and sleep
-    if (displayedSchedules.empty())
-    {
-        showStatusMessage("Brak odjazd\xC3\xB3""w!"); // Brak odjazdów
-        // Sleep for a minute before trying again
-        // Note: Status message already does a refresh, so we can just sleep
+    if (displayList.empty()) {
+       u8g2.setFont(u8g2_font_helvB18_te);
+       displayTextOnCenterHorizontally("Brak odjazdów", schedulesY + 50);
+    } else {
+       displayBusStopSchedule(schedulesY, displayList);
     }
-    else 
-    {
-        // Data found, redraw background (partial) to clear the "Fetching data" status message
-        // passing 'false' means it clears the status area but keeps the main UI
-        drawBackground(false); 
-    }
-  }
+  } while (display.nextPage());
 
-  if (!displayedSchedules.empty()) 
-  {
-    displayedSchedules = convertScheduleTimesToMinutesLeft(displayedSchedules);
-
-    // Partial Refresh for the schedule area only
-    display.setPartialWindow(0, secondLineY + 1, display.width(), display.height() - secondLineY - 1);
-    display.firstPage();
-    do
-    {
-      display.fillScreen(GxEPD_WHITE);
-      displayBusStopSchedule(schedulesY, displayedSchedules);
-    } while (display.nextPage());
-  }
   display.hibernate();
 
-  // Recalculate time to sleep until the next full minute
+  // Sleep
   if (!getLocalTime(&timeinfo)) return;
+  int secondsToSleep = (60 - timeinfo.tm_sec) + 2; 
+  uint64_t sleepUs = (uint64_t)secondsToSleep * 1000000ULL;
+  esp_sleep_enable_timer_wakeup(sleepUs);
   
-  time_t now = mktime(&timeinfo);
-  time_t nextMinute = now + (60 - timeinfo.tm_sec); // Seconds until next minute
-  
-  // Calculate duration in microseconds for ESP32 timer
-  uint64_t sleepDurationUs = (uint64_t)(nextMinute - now) * 1000000ULL;
-
-  // Ensure we sleep at least 1 second to avoid rapid loops
-  if(sleepDurationUs < 1000000ULL) sleepDurationUs = 1000000ULL;
-
-  esp_sleep_enable_timer_wakeup(sleepDurationUs);
   esp_light_sleep_start();
 }
 
-/* Function Definitions */
+// --- HELPERS ---
 
-// Draw static parts of the display
 void drawBackground(bool isFullRefresh) {
-  if (isFullRefresh) {
-    display.setFullWindow();
-  } else {
-    // Redraw headers in case a Status Message overwrote them.
-    // Refresh the top part of the screen.
-    display.setPartialWindow(0, 0, display.width(), secondLineY + 2);
-  }
+  if (isFullRefresh) display.setFullWindow();
+  else display.setPartialWindow(0, 0, display.width(), 100); 
 
   display.firstPage();
-  do
-  {
+  do {
     display.fillScreen(GxEPD_WHITE);
-
-    displayBusStopName(MARSZALKOWSKA_BUS_STOP_NAME, MARSZALKOWSKA_BUS_STOP_NRS);
+    displayBusStopName(BUS_STOP_NAME, BUS_STOP_NR);
 
     int lineY = (int)(1.5 * BUS_STOP_NAME_Y_OFFSET);
     display.drawLine(X_MARGIN, lineY, display.width() - X_MARGIN, lineY, GxEPD_BLACK);
@@ -237,181 +183,114 @@ void drawBackground(bool isFullRefresh) {
 
     u8g2.setFont(u8g2_font_helvR12_te);
     u8g2.setForegroundColor(GxEPD_BLACK);
-
     int8_t fontAscent = u8g2.getFontAscent();
     int headerY = lineY + (HEADER_ROW_HEIGHT / 2) + (fontAscent / 2);
 
     u8g2.setCursor(X_MARGIN + LINE_TEXTBOX_PADDING, headerY);
     u8g2.print("Linia");
-
     displayTextOnCenterHorizontally("Kierunek", headerY);
-
     int16_t w = u8g2.getUTF8Width("Odjazd");
     u8g2.setCursor(display.width() - X_MARGIN - w, headerY);
     u8g2.print("Odjazd");
 
     schedulesY = secondLineY + 45;
-
   } while (display.nextPage());
 }
 
-void showStatusMessage(const String &text)
-{
-  // Center screen popup
-  int16_t h = 60;
-  int16_t y_start = (display.height() - h) / 2;
+void connectToWifi(bool silent) {
+  if (!silent) showStatusMessage("Łączenie z WiFi...");
+  if (WiFi.status() == WL_CONNECTED) return;
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(SECRET_SSID, SECRET_PASS);
+  int r = 0;
+  while (WiFi.status() != WL_CONNECTED && r < 20) { delay(500); r++; }
+  if (!silent && WiFi.status() != WL_CONNECTED) showStatusMessage("Błąd WiFi!");
+}
 
-  display.setPartialWindow(0, y_start, display.width(), h);
+void syncTime(bool silent) {
+  if (!silent) showStatusMessage("Sync. Czasu...");
+  configTime(0, 0, ntpServer);
+  setenv("TZ", tzInfo, 1);
+  tzset();
+  struct tm t;
+  int r = 0;
+  while (!getLocalTime(&t, 100) && r < 20) { r++; delay(100); }
+}
+
+void displayBusStopName(const String &busStopName, const String &busStopNr) {
+  u8g2.setForegroundColor(GxEPD_BLACK);
+  u8g2.setFont(u8g2_font_helvB18_te);
+  displayTextOnCenterHorizontally(busStopName + " " + busStopNr, BUS_STOP_NAME_Y_OFFSET);
+}
+
+void displayBusStopSchedule(const int y, const std::vector<ScheduleEntry> &schedules) {
+  int16_t yPos = y;
+  for (const auto &entry : schedules) {
+    if (yPos > display.height()) break;
+
+    // Line
+    u8g2.setFont(u8g2_font_helvB18_te);
+    int w = u8g2.getUTF8Width(entry.line.c_str());
+    int h = u8g2.getFontAscent();
+    int rX = X_MARGIN;
+    int rY = yPos - h - LINE_TEXTBOX_PADDING;
+    int rW = w + (2 * LINE_TEXTBOX_PADDING);
+    int rH = h + (2 * LINE_TEXTBOX_PADDING);
+
+    display.fillRect(rX, rY, rW, rH, GxEPD_BLACK);
+    u8g2.setForegroundColor(GxEPD_WHITE);
+    u8g2.setBackgroundColor(GxEPD_BLACK);
+    u8g2.setCursor(rX + LINE_TEXTBOX_PADDING, yPos);
+    u8g2.print(entry.line);
+    u8g2.setForegroundColor(GxEPD_BLACK);
+    u8g2.setBackgroundColor(GxEPD_WHITE);
+
+    // Time
+    u8g2.setFont(u8g2_font_helvB18_te);
+    w = u8g2.getUTF8Width(entry.time.c_str());
+    int tX = display.width() - X_MARGIN - w;
+    u8g2.setCursor(tX, yPos);
+    u8g2.print(entry.time);
+
+    // Direction
+    u8g2.setFont(u8g2_font_helvR18_te);
+    int dX = rX + rW + 10;
+    int maxW = tX - dX - 5;
+    String pD = entry.direction;
+    while (pD.length() > 0 && u8g2.getUTF8Width((pD + "...").c_str()) > maxW) {
+       pD.remove(pD.length() - 1);
+    }
+    if (pD != entry.direction) pD += "...";
+    u8g2.setCursor(dX, yPos);
+    u8g2.print(pD);
+    yPos += Y_OFFSET;
+  }
+}
+
+void showStatusMessage(const String &text) {
+  int16_t h = 60;
+  int16_t y = (display.height() - h) / 2;
+  display.setPartialWindow(0, y, display.width(), h);
   display.firstPage();
-  do
-  {
+  do {
     display.fillScreen(GxEPD_WHITE);
-    display.drawRect(10, y_start, display.width()-20, h, GxEPD_BLACK);
+    display.drawRect(10, y, display.width()-20, h, GxEPD_BLACK);
     displayTextOnCenter(text);
   } while (display.nextPage());
 }
 
-void displayTextOnCenter(const String &text)
-{
+void displayTextOnCenter(const String &text) {
   u8g2.setFont(u8g2_font_helvR18_te);
   int16_t w = u8g2.getUTF8Width(text.c_str());
-  int16_t h = u8g2.getFontAscent();
   int16_t x = (display.width() - w) / 2;
-  int16_t y = (display.height() / 2) + (h / 2);
-
+  int16_t y = (display.height() / 2) + (u8g2.getFontAscent() / 2);
   u8g2.setCursor(x, y);
-  u8g2.setForegroundColor(GxEPD_BLACK);
   u8g2.print(text);
 }
 
-void displayTextOnCenterHorizontally(const String &text, const int y)
-{
+void displayTextOnCenterHorizontally(const String &text, const int y) {
   int16_t w = u8g2.getUTF8Width(text.c_str());
   int16_t x = (display.width() - w) / 2;
   u8g2.setCursor(x, y);
-  u8g2.setForegroundColor(GxEPD_BLACK);
   u8g2.print(text);
-}
-
-void connectToWifi()
-{
-  showStatusMessage("\xC5\x81\xC4\x85""czenie z WiFi...");
-  
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
-  
-  int retryCount = 0;
-  while (WiFi.status() != WL_CONNECTED && retryCount < 20)
-  {
-    delay(500);
-    retryCount++;
-  }
-
-  if (WiFi.status() == WL_CONNECTED)
-  {
-    showStatusMessage("Po\xC5\x82\xC4\x85""czono z WiFi!");
-  }
-  else
-  {
-    showStatusMessage("B\xC5\x82\xC4\x85""d WiFi!");
-    delay(2000);
-  }
-}
-
-void syncTime()
-{
-  showStatusMessage("Synchronizacja czasu...");
-  configTime(0, 0, ntpServer);
-  setenv("TZ", tzInfo, 1);
-  tzset();
-
-  struct tm timeinfo;
-  int retry = 0;
-  while (!getLocalTime(&timeinfo, 100) && retry < 50)
-  {
-    retry++;
-    delay(100);
-  }
-}
-
-void displayBusStopName(const String &busStopName, const std::vector<String> &busStopNrs)
-{
-  u8g2.setForegroundColor(GxEPD_BLACK);
-  u8g2.setFont(u8g2_font_helvB18_te);
-
-  String displayedText = busStopName;
-  for (const auto &busNr : busStopNrs)
-  {
-    displayedText += " " + String(busNr) + " &";
-  }
-  if (displayedText.endsWith(" &"))
-  {
-    displayedText.remove(displayedText.length() - 2);
-  }
-
-  displayTextOnCenterHorizontally(displayedText, BUS_STOP_NAME_Y_OFFSET);
-}
-
-void displayBusStopSchedule(const int y, const std::vector<ScheduleEntry> &schedules)
-{
-  if (schedules.empty())
-  {
-    u8g2.setFont(u8g2_font_helvB18_te);
-    u8g2.setForegroundColor(GxEPD_BLACK);
-    displayTextOnCenterHorizontally("Brak odjazdów", y + Y_OFFSET);
-    return;
-  }
-
-  int16_t yPosition = y;
-  for (const auto &entry : schedules)
-  {
-    if (yPosition > display.height()) break;
-
-    // --- Line Number Box ---
-    u8g2.setFont(u8g2_font_helvB18_te);
-    int w = u8g2.getUTF8Width(entry.line.c_str());
-    int h = u8g2.getFontAscent();
-
-    const int rectX = X_MARGIN;
-    const int rectY = yPosition - h - LINE_TEXTBOX_PADDING;
-    const int rectWidth = w + (2 * LINE_TEXTBOX_PADDING);
-    const int rectHeight = h + (2 * LINE_TEXTBOX_PADDING);
-
-    display.fillRect(rectX, rectY, rectWidth, rectHeight, GxEPD_BLACK);
-
-    u8g2.setForegroundColor(GxEPD_WHITE);
-    u8g2.setBackgroundColor(GxEPD_BLACK);
-    u8g2.setCursor(rectX + LINE_TEXTBOX_PADDING, yPosition);
-    u8g2.print(entry.line);
-
-    u8g2.setForegroundColor(GxEPD_BLACK);
-    u8g2.setBackgroundColor(GxEPD_WHITE);
-
-    // --- Time ---
-    u8g2.setFont(u8g2_font_helvB18_te);
-    w = u8g2.getUTF8Width(entry.time.c_str());
-    const int timeX = display.width() - X_MARGIN - w;
-    u8g2.setCursor(timeX, yPosition);
-    u8g2.print(entry.time);
-
-    // --- Direction ---
-    u8g2.setFont(u8g2_font_helvR18_te);
-    const int directionX = rectX + rectWidth + (rectWidth / 4);
-    int maxDirWidth = timeX - directionX - 10;
-
-    String printDir = entry.direction;
-    if (u8g2.getUTF8Width(printDir.c_str()) > maxDirWidth)
-    {
-      while (printDir.length() > 0 && u8g2.getUTF8Width((printDir + "...").c_str()) > maxDirWidth)
-      {
-        printDir.remove(printDir.length() - 1);
-      }
-      printDir += "...";
-    }
-
-    u8g2.setCursor(directionX, yPosition);
-    u8g2.print(printDir);
-
-    yPosition += Y_OFFSET;
-  }
 }
