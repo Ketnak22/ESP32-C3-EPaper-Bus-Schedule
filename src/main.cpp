@@ -1,25 +1,15 @@
 #include <Arduino.h>
 #include <vector>
+#include <array>
 #include <WiFi.h>
 #include <time.h>
+#include <Encoder.h>
+#include <ezButton.h>
 
 #include "ztm_api.h"
 #include "secrets.h"
 
 #include <U8g2_for_Adafruit_GFX.h>
-
-const String BUS_STOP_ID = "7009"; // Marszałkowska
-const String BUS_STOP_NR = "01";
-const String BUS_STOP_NAME = "Marszałkowska";
-
-// Assuming refresh every 1 minute, do a full refresh every 60 minutes
-const int FULL_REFRESH_THRESHOLD = 60; 
-
-const char *ntpServer = "pool.ntp.org";
-const char *tzInfo = "CET-1CEST,M3.5.0,M10.5.0/3";
-
-#define ENABLE_GxEPD2_display 0
-#include <GxEPD2_BW.h>
 
 // Pin Declarations
 static const uint8_t EPD_BUSY = 21;
@@ -28,6 +18,40 @@ static const uint8_t EPD_RST = 7;
 static const uint8_t EPD_DC = 6;
 static const uint8_t EPD_SCK = 8;
 static const uint8_t EPD_MOSI = 10;
+static const uint8_t RT_CLK = 4;
+static const uint8_t RT_DW = 3;
+static const uint8_t RT_SW = 2; // Button Pin
+
+Encoder encoder(RT_CLK, RT_DW);
+int prevEncoderPos = 0;
+
+ezButton encoderBtn(RT_SW);
+
+// Variable to track button holding time
+unsigned long buttonPressStart = 0;
+
+struct BUS_STOP_INFO {
+    String id;
+    std::vector<String> nr;
+    String name;
+};
+
+const std::array<BUS_STOP_INFO, 3> busStops = {{
+    {"7009", {"01", "02"}, "Marszałkowska"},
+    {"2097", {"01", "02", "03", "04"}, "Saska"},
+    {"2329", {"01", "02"}, "Majdan Widoczna"}
+}};
+
+uint8_t currentBusStop = 0;
+uint8_t currentBusStopNrIndex = 0;
+
+const int FULL_REFRESH_THRESHOLD = 60; 
+
+const char *ntpServer = "pool.ntp.org";
+const char *tzInfo = "CET-1CEST,M3.5.0,M10.5.0/3";
+
+#define ENABLE_GxEPD2_display 0
+#include <GxEPD2_BW.h>
 
 GxEPD2_BW<GxEPD2_420_GDEY042T81, GxEPD2_420_GDEY042T81::HEIGHT> display(GxEPD2_420_GDEY042T81(EPD_CS, EPD_DC, EPD_RST, EPD_BUSY));
 U8G2_FOR_ADAFRUIT_GFX u8g2;
@@ -42,11 +66,10 @@ static const uint8_t Y_OFFSET = 50;
 int schedulesY = 0;
 int secondLineY = 0;
 
-// Global cache of schedules
 std::vector<ScheduleEntry> globalSchedules;
-
-// Refresh Counter (Stored in RTC memory to survive sleep)
-RTC_DATA_ATTR int refreshCounter = 0;
+int refreshCounter = 0; 
+const unsigned long REFRESH_INTERVAL_MS = 60000; 
+unsigned long previousRefreshMillis = 0;
 
 // Declarations
 void connectToWifi(bool silent);
@@ -57,6 +80,8 @@ void displayTextOnCenterHorizontally(const String &text, const int y);
 void displayTextOnCenter(const String &text);
 void showStatusMessage(const String &text);
 void displayBusStopName(const String &busStopName, const String &busStopNr);
+void refreshLogic();
+void enterDeepSleep(); // Logic to turn off
 
 void setup() {
   Serial.begin(115200);
@@ -73,29 +98,106 @@ void setup() {
   display.firstPage();
   do { display.fillScreen(GxEPD_WHITE); } while (display.nextPage());
 
-  // Setup Network & Time
   connectToWifi(false);
   syncTime(false);
 
-  // Initial Fetch
   showStatusMessage("Pobieranie danych...");
-  globalSchedules = fetchScheduleFromServer(BUS_STOP_ID, BUS_STOP_NR);
+  globalSchedules = fetchScheduleFromServer(busStops[currentBusStop].id, busStops[currentBusStop].nr[currentBusStopNrIndex]);
   
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
 
-  // Initial full draw
   drawBackground(true);
   
-  // Reset counter on clean boot
-  refreshCounter = 0; 
+  previousRefreshMillis = millis(); 
+  refreshCounter = 1; 
+
+  refreshLogic();
 }
 
 void loop() {
+  encoderBtn.loop();
   
+  // Shutdown logic
+  if (encoderBtn.getState() == 0) { 
+      // If we weren't holding it before, mark the start time
+      if (buttonPressStart == 0) {
+          buttonPressStart = millis();
+      }
+      else if (millis() - buttonPressStart > 5000) {
+          enterDeepSleep();
+      }
+  } else {
+      buttonPressStart = 0;
+  }
+
+  long newPosition = encoder.read() / 4;
+  bool actionTaken = false;
+
+  // Encoder Rotation Logic
+  if (newPosition != prevEncoderPos) {
+    if (newPosition > prevEncoderPos) {
+        currentBusStop = (currentBusStop + 1) % busStops.size();
+    } else {
+        currentBusStop = (currentBusStop - 1 + busStops.size()) % busStops.size();
+    }
+    currentBusStopNrIndex = 0;
+    
+    Serial.printf("Encoder position: %d. New stop: %s\n", (int)newPosition, busStops[currentBusStop].name.c_str());
+    prevEncoderPos = newPosition;
+    actionTaken = true;
+  }
+
+  // Short Press Logic (Only triggers on release-to-press transition)
+  if (encoderBtn.isPressed()) {
+      currentBusStopNrIndex = (currentBusStopNrIndex + 1) % busStops[currentBusStop].nr.size();
+      Serial.printf("Button pressed. New bus stop number: %s\n", busStops[currentBusStop].nr[currentBusStopNrIndex].c_str());
+      actionTaken = true;
+  }
+
+  if (actionTaken) {
+      Serial.println("Input detected. Updating display...");
+      globalSchedules.clear(); 
+      drawBackground(true);
+      refreshCounter = 1; 
+      refreshLogic(); 
+      previousRefreshMillis = millis(); 
+  }
+  
+  unsigned long currentMillis = millis();
+  if (currentMillis - previousRefreshMillis >= REFRESH_INTERVAL_MS) {
+    previousRefreshMillis = currentMillis; 
+    refreshLogic();
+  }
+}
+
+void enterDeepSleep() {
+    Serial.println("Long press detected. Shutting down...");
+    
+    // Clear and power off the display
+    display.setFullWindow();
+    display.firstPage();
+    do {
+        display.fillScreen(GxEPD_WHITE);
+    } while (display.nextPage());
+    display.powerOff();
+
+    // Wait for button release
+    Serial.println("Waiting for button release...");
+    while(digitalRead(RT_SW) == 0) {
+        delay(50);
+    }
+    
+    Serial.println("Entering Deep Sleep.");
+    Serial.flush(); 
+    
+    esp_deep_sleep_start();
+}
+
+void refreshLogic() {
+  Serial.println("--- Starting Scheduled Refresh ---");
   struct tm timeinfo;
   bool timeValid = getLocalTime(&timeinfo);
-  
   if (!timeValid) {
       connectToWifi(true);
       syncTime(true);
@@ -103,48 +205,26 @@ void loop() {
       WiFi.mode(WIFI_OFF);
       getLocalTime(&timeinfo);
   }
-
   removePastSchedules(globalSchedules);
-
   if (globalSchedules.size() <= 3) {
-      
-      Serial.println("Fetching new data...");
-      
       connectToWifi(true);
       syncTime(true); 
-
-      // Fetch fresh data
-      std::vector<ScheduleEntry> freshData = fetchScheduleFromServer(BUS_STOP_ID, BUS_STOP_NR);
-      
-      if (!freshData.empty()) {
-          globalSchedules = freshData;
-      }
-      
+      std::vector<ScheduleEntry> freshData = fetchScheduleFromServer(busStops[currentBusStop].id, busStops[currentBusStop].nr[currentBusStopNrIndex]);
+      if (!freshData.empty()) globalSchedules = freshData;
       WiFi.disconnect(true);
       WiFi.mode(WIFI_OFF);
-  } else {
-      Serial.printf("Cache ok (%d buses). Skipping WiFi.\n", globalSchedules.size());
-  }
-
-  // Full refresh logic
+  } 
   refreshCounter++;
-  
   if (refreshCounter >= FULL_REFRESH_THRESHOLD) {
-      Serial.println("Triggering Full Refresh to clean ghosting...");
       drawBackground(true);
       refreshCounter = 0;
   }
-
-  // Calculate x minutes left
   std::vector<ScheduleEntry> displayList = convertScheduleTimesToMinutesLeft(globalSchedules);
-  displayList.resize(std::min((size_t)3, displayList.size())); // Limit to 3 entries
-
-  // Populate schedules
+  displayList.resize(std::min((size_t)3, displayList.size())); 
   display.setPartialWindow(0, secondLineY + 1, display.width(), display.height() - secondLineY - 1);
   display.firstPage();
   do {
     display.fillScreen(GxEPD_WHITE);
-
     if (displayList.empty()) {
        u8g2.setFont(u8g2_font_helvB18_te);
        displayTextOnCenterHorizontally("Brak odjazdów", schedulesY + 50);
@@ -152,47 +232,30 @@ void loop() {
        displayBusStopSchedule(schedulesY, displayList);
     }
   } while (display.nextPage());
-
   display.hibernate();
-
-  // Sleep
-  if (!getLocalTime(&timeinfo)) return;
-  int secondsToSleep = (60 - timeinfo.tm_sec) + 2; 
-  uint64_t sleepUs = (uint64_t)secondsToSleep * 1000000ULL;
-  esp_sleep_enable_timer_wakeup(sleepUs);
-  
-  esp_light_sleep_start();
 }
-
-// --- HELPERS ---
 
 void drawBackground(bool isFullRefresh) {
   if (isFullRefresh) display.setFullWindow();
   else display.setPartialWindow(0, 0, display.width(), 100); 
-
   display.firstPage();
   do {
     display.fillScreen(GxEPD_WHITE);
-    displayBusStopName(BUS_STOP_NAME, BUS_STOP_NR);
-
+    displayBusStopName(busStops[currentBusStop].name, busStops[currentBusStop].nr[currentBusStopNrIndex]);
     int lineY = (int)(1.5 * BUS_STOP_NAME_Y_OFFSET);
     display.drawLine(X_MARGIN, lineY, display.width() - X_MARGIN, lineY, GxEPD_BLACK);
-
     secondLineY = lineY + HEADER_ROW_HEIGHT;
     display.drawLine(X_MARGIN, secondLineY, display.width() - X_MARGIN, secondLineY, GxEPD_BLACK);
-
     u8g2.setFont(u8g2_font_helvR12_te);
     u8g2.setForegroundColor(GxEPD_BLACK);
     int8_t fontAscent = u8g2.getFontAscent();
     int headerY = lineY + (HEADER_ROW_HEIGHT / 2) + (fontAscent / 2);
-
     u8g2.setCursor(X_MARGIN + LINE_TEXTBOX_PADDING, headerY);
     u8g2.print("Linia");
     displayTextOnCenterHorizontally("Kierunek", headerY);
     int16_t w = u8g2.getUTF8Width("Odjazd");
     u8g2.setCursor(display.width() - X_MARGIN - w, headerY);
     u8g2.print("Odjazd");
-
     schedulesY = secondLineY + 45;
   } while (display.nextPage());
 }
@@ -227,8 +290,6 @@ void displayBusStopSchedule(const int y, const std::vector<ScheduleEntry> &sched
   int16_t yPos = y;
   for (const auto &entry : schedules) {
     if (yPos > display.height()) break;
-
-    // Line
     u8g2.setFont(u8g2_font_helvB18_te);
     int w = u8g2.getUTF8Width(entry.line.c_str());
     int h = u8g2.getFontAscent();
@@ -236,7 +297,6 @@ void displayBusStopSchedule(const int y, const std::vector<ScheduleEntry> &sched
     int rY = yPos - h - LINE_TEXTBOX_PADDING;
     int rW = w + (2 * LINE_TEXTBOX_PADDING);
     int rH = h + (2 * LINE_TEXTBOX_PADDING);
-
     display.fillRect(rX, rY, rW, rH, GxEPD_BLACK);
     u8g2.setForegroundColor(GxEPD_WHITE);
     u8g2.setBackgroundColor(GxEPD_BLACK);
@@ -244,15 +304,11 @@ void displayBusStopSchedule(const int y, const std::vector<ScheduleEntry> &sched
     u8g2.print(entry.line);
     u8g2.setForegroundColor(GxEPD_BLACK);
     u8g2.setBackgroundColor(GxEPD_WHITE);
-
-    // Time
     u8g2.setFont(u8g2_font_helvB18_te);
     w = u8g2.getUTF8Width(entry.time.c_str());
     int tX = display.width() - X_MARGIN - w;
     u8g2.setCursor(tX, yPos);
     u8g2.print(entry.time);
-
-    // Direction
     u8g2.setFont(u8g2_font_helvR18_te);
     int dX = rX + rW + 10;
     int maxW = tX - dX - 5;
