@@ -72,23 +72,11 @@ void removePastSchedules(std::vector<ScheduleEntry> &schedules) {
     schedules.erase(std::remove_if(schedules.begin(), schedules.end(), [currentMins](const ScheduleEntry &entry) {
         int busMins = parseTimeStr(entry.time);
         int diff = busMins - currentMins;
-
-        // Handle midnight (Bus 00:05 vs Current 23:55 -> diff approx -1430)
-        // If bus is 24:05 (ZTM format) and current is 00:05, we need to handle that.
-        // Assuming Python returns ZTM format (24:xx), and getCurrentMinutes returns standard (00:xx).
-        // Standard diff:
-        
-        // Case 1: Bus 24:05 (1445), Current 00:05 (5). Diff = 1440. Keep.
-        // Case 2: Bus 16:00 (960), Current 16:02 (962). Diff = -2. Remove.
-        // Case 3: Bus 00:05 (5), Current 23:55 (1435). Diff = -1430. Keep (Next day).
-
-        // If diff is huge positive (1400+), it means Bus is "24:xx" and we are "00:xx". It's future.
-        // If diff is huge negative (-1400+), it means Bus is "00:xx" and we are "23:xx". It's future.
         
         if (diff > 1000) return false; // Future (Midnight wrap)
         if (diff < -1000) return false; // Future (Midnight wrap)
 
-        // Remove if passed more than 1 minute ago (diff < -1)
+        // Remove if passed more than 1 minute ago
         return diff < -1; 
     }), schedules.end());
 }
